@@ -1,15 +1,14 @@
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.5.1
+# Base requirements — works on Windows (CPU) and Linux (CPU)
+# For Linux GPU training, use requirements-server.txt instead
+torch>=2.2.0
 torchvision
 omegaconf
 torchmetrics
 fvcore
 iopath
-xformers==0.0.29
 submitit
---extra-index-url https://pypi.nvidia.com
-cuml-cu11
 einops
 wandb
 timm
-# swanlab # optional experiments tracking tool if wandb doesn't work
+datasets>=2.18.0
+huggingface_hub>=0.21.0

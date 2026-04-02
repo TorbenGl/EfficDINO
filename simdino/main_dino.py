@@ -15,10 +15,13 @@ import argparse
 import builtins
 import os
 import sys
+import signal
 import datetime
 import time
 import math
 import json
+import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +39,41 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 import wandb
+
+# Global flag for graceful interruption
+_INTERRUPTED = False
+
+
+# -------- HuggingFace ImageNet dataset helpers --------
+
+class HFImageNetDataset(torch.utils.data.Dataset):
+    """Wraps a HuggingFace datasets.Dataset as a PyTorch Dataset."""
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
+        self.transform = transform
+
+    @property
+    def targets(self):
+        return [int(x) for x in self.dataset['label']]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        img = sample['image']
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        img = img.convert('RGB')
+        label = int(sample['label'])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+def _load_hf_dataset(data_path, split):
+    from datasets import load_dataset
+    return load_dataset(data_path, split=split, trust_remote_code=False)
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -129,6 +167,9 @@ def get_args_parser():
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--dataset_type', default='imagefolder', type=str,
+        choices=['imagefolder', 'hf_imagenet'],
+        help='Dataset format: imagefolder (default, expects class subdirs) or hf_imagenet (HuggingFace snapshot_download root)')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -146,13 +187,140 @@ def get_args_parser():
                     help='eps for TCR (default: 0.5)')
     parser.add_argument('--reduce_cov', type=int, default=0, help="""Whether or not all_reduce covariance matrices across gpus.""")
     parser.add_argument('--expa_type', type=int, default=1, help="""Whether or not apply smoothing in expansion_term.""")
+
+    # EfficEmbed
+    parser.add_argument('--embed_type', default='standard', type=str, choices=['standard', 'efficembed'],
+        help='Patch embedding type: standard (Conv2d) or efficembed (sub-patch tokenization)')
+    parser.add_argument('--sub_patch_size', default=4, type=int,
+        help='Sub-patch conv kernel size for efficembed (default: 4)')
+    parser.add_argument('--sub_patch_channels', default=None, type=int,
+        help='Number of channels for sub-patch conv (default: auto-computed to match embed_dim)')
+
+    # Gradient accumulation
+    parser.add_argument('--grad_accum_steps', default=1, type=int,
+        help='Number of gradient accumulation steps (effective_batch = batch_size_per_gpu * world_size * grad_accum_steps)')
+
+    # Enhanced checkpointing
+    parser.add_argument('--keep_last_ckpts', default=3, type=int,
+        help='Number of periodic checkpoints to keep (older ones are deleted)')
+
+    # Periodic k-NN evaluation
+    parser.add_argument('--eval_freq', default=0, type=int,
+        help='Run k-NN evaluation every N epochs during training (0 to disable)')
+    parser.add_argument('--eval_data_path', default='', type=str,
+        help='Path to ImageNet root (with train/ and val/ subdirs) for periodic k-NN eval')
+
+    # WandB
+    parser.add_argument('--wandb_project', default='simdinov1', type=str, help='WandB project name')
+    parser.add_argument('--wandb_run_name', default='', type=str, help='WandB run name (default: output_dir basename)')
+    parser.add_argument('--wandb_run_id', default='', type=str,
+        help='WandB run ID for resuming logging (auto-saved in checkpoint)')
+
     return parser
 
 
+def _sigterm_handler(signum, frame):
+    global _INTERRUPTED
+    _INTERRUPTED = True
+    print(f"\nReceived signal {signum}, will save checkpoint and exit after current epoch...")
+
+
+def _build_checkpoint(student, teacher, optimizer, fp16_scaler, dino_loss, epoch, args,
+                      best_knn=0.0, wandb_run_id=''):
+    save_dict = {
+        'student': student.state_dict(),
+        'teacher': teacher.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': epoch + 1,
+        'args': args,
+        'dino_loss': dino_loss.state_dict(),
+        'best_knn': best_knn,
+        'wandb_run_id': wandb_run_id,
+        'rng_states': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.random.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all(),
+        },
+    }
+    if fp16_scaler is not None:
+        save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+    return save_dict
+
+
+def _rotate_checkpoints(output_dir, keep_last=3):
+    """Keep only the last N periodic checkpoints (checkpoint_NNNN.pth)."""
+    import glob
+    ckpts = sorted(glob.glob(os.path.join(output_dir, 'checkpoint_[0-9][0-9][0-9][0-9].pth')))
+    # Never delete checkpoint_best.pth, checkpoint.pth, or checkpoint_interrupted.pth
+    if len(ckpts) > keep_last:
+        for old_ckpt in ckpts[:-keep_last]:
+            os.remove(old_ckpt)
+            print(f"Removed old checkpoint: {old_ckpt}")
+
+
+def _run_knn_eval(model, args):
+    """Run k-NN evaluation on ImageNet val set. Returns top1 accuracy."""
+    from eval_knn import extract_features, knn_classifier, ReturnIndexDataset, ReturnIndexHFDataset
+    from torchvision import transforms as pth_transforms
+
+    transform = pth_transforms.Compose([
+        pth_transforms.Resize(256, interpolation=3),
+        pth_transforms.CenterCrop(224),
+        pth_transforms.ToTensor(),
+        pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+    dataset_type = getattr(args, 'dataset_type', 'imagefolder')
+    if dataset_type == 'hf_imagenet':
+        eval_root = args.eval_data_path or args.data_path
+        dataset_train = ReturnIndexHFDataset(_load_hf_dataset(eval_root, 'train'), transform=transform)
+        dataset_val = ReturnIndexHFDataset(_load_hf_dataset(eval_root, 'validation'), transform=transform)
+    else:
+        dataset_train = ReturnIndexDataset(os.path.join(args.eval_data_path, "train"), transform=transform)
+        dataset_val = ReturnIndexDataset(os.path.join(args.eval_data_path, "val"), transform=transform)
+    sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=False)
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler, batch_size=128,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=128,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+
+    model.eval()
+    train_features = extract_features(model, data_loader_train, use_cuda=True)
+    test_features = extract_features(model, data_loader_val, use_cuda=True)
+
+    top1 = 0.0
+    if utils.get_rank() == 0:
+        train_features = nn.functional.normalize(train_features, dim=1, p=2)
+        test_features = nn.functional.normalize(test_features, dim=1, p=2)
+        train_labels = torch.tensor(dataset_train.targets).long().cuda()
+        test_labels = torch.tensor(dataset_val.targets).long().cuda()
+        top1, top5 = knn_classifier(train_features.cuda(), train_labels,
+                                    test_features.cuda(), test_labels, k=20, T=0.07)
+        print(f"k-NN eval: Top1={top1:.2f}%, Top5={top5:.2f}%")
+
+    # Broadcast result to all ranks
+    top1_tensor = torch.tensor([top1], device='cuda')
+    dist.broadcast(top1_tensor, src=0)
+    model.train()
+    return top1_tensor.item()
+
+
 def train_dino(args):
+    global _INTERRUPTED
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
+
+    # Register signal handlers for graceful interruption
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    if hasattr(signal, 'SIGUSR1'):
+        signal.signal(signal.SIGUSR1, _sigterm_handler)
+
     if utils.is_main_process():
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         with open(Path(args.output_dir, "args.log"), "w") as f:
@@ -170,21 +338,41 @@ def train_dino(args):
     builtins.print = print
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
-    
+
+    effective_batch = args.batch_size_per_gpu * utils.get_world_size() * args.grad_accum_steps
+    print(f"Effective batch size: {args.batch_size_per_gpu} x {utils.get_world_size()} GPUs x {args.grad_accum_steps} accum = {effective_batch}")
+
     assert not(args.track_wandb and args.track_swan), "Please do not use both tracking methods simultaneously."
+
+    # ============ optionally resume training (load checkpoint first to get wandb_run_id) ============
+    # We do a pre-check for resume to extract wandb_run_id before initializing wandb
+    resumed_wandb_id = ''
+    ckp_path = os.path.join(args.output_dir, "checkpoint.pth")
+    if os.path.isfile(ckp_path):
+        ckp = torch.load(ckp_path, map_location="cpu")
+        resumed_wandb_id = ckp.get('wandb_run_id', '')
+        del ckp
+
     # ============ setup wandb ============
+    wandb_run_id = ''
     if args.track_wandb and utils.is_main_process():
-        runname = args.output_dir.rstrip('/').split('/')[-1]
-        wandb.init(project="simdinov1", name=runname)
-        wandb.config.update(args)
-    
+        runname = args.wandb_run_name or args.output_dir.rstrip('/').split('/')[-1]
+        # Resume wandb run if we have a run_id from checkpoint or CLI
+        resume_id = args.wandb_run_id or resumed_wandb_id
+        if resume_id:
+            wandb.init(project=args.wandb_project, name=runname, id=resume_id, resume="allow")
+        else:
+            wandb.init(project=args.wandb_project, name=runname)
+        wandb.config.update(args, allow_val_change=True)
+        wandb_run_id = wandb.run.id
+
     # ============ setup swanlab ============
     if args.track_swan and utils.is_main_process():
         import swanlab
-        runname = args.output_dir.rstrip('/').split('/')[-1]
+        runname = args.wandb_run_name or args.output_dir.rstrip('/').split('/')[-1]
         swanlab.sync_wandb()
-        wandb.init(project="simdinov1", name=runname, mode='offline')
-        wandb.config.update(args)
+        wandb.init(project=args.wandb_project, name=runname, mode='offline')
+        wandb.config.update(args, allow_val_change=True)
     args.enable_logging = utils.is_main_process() and (args.track_wandb or args.track_swan)
 
     # ============ preparing data ... ============
@@ -193,7 +381,10 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    if getattr(args, 'dataset_type', 'imagefolder') == 'hf_imagenet':
+        dataset = HFImageNetDataset(_load_hf_dataset(args.data_path, 'train'), transform=transform)
+    else:
+        dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -206,15 +397,21 @@ def train_dino(args):
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
-    # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
-    # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
-            drop_path_rate=args.drop_path_rate,  # stochastic depth
+            drop_path_rate=args.drop_path_rate,
+            embed_type=args.embed_type,
+            sub_patch_size=args.sub_patch_size,
+            sub_patch_channels=args.sub_patch_channels,
         )
-        teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        teacher = vits.__dict__[args.arch](
+            patch_size=args.patch_size,
+            embed_type=args.embed_type,
+            sub_patch_size=args.sub_patch_size,
+            sub_patch_channels=args.sub_patch_channels,
+        )
         embed_dim = student.embed_dim
     elif args.arch in torchvision_models.__dict__.keys():
         student = torchvision_models.__dict__[args.arch]()
@@ -242,12 +439,9 @@ def train_dino(args):
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
-
-        # we need DDP wrapper to have synchro batch norms working...
         teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
-        # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
@@ -255,17 +449,15 @@ def train_dino(args):
     if args.compile:
         teacher = torch.compile(teacher)
         student = torch.compile(student)
-    # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
-    
-    
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+
+    print(f"Student and Teacher are built: they are both {args.arch} network (embed_type={args.embed_type}).")
 
     # ============ preparing loss ... ============
     if args.use_simdino:
         dino_loss = MCRLoss(
-            args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+            args.local_crops_number + 2,
             args.reduce_cov,
             args.expa_type,
             args.eps,
@@ -274,7 +466,7 @@ def train_dino(args):
     else:
         dino_loss = DINOLoss(
             args.out_dim,
-            args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+            args.local_crops_number + 2,
             args.warmup_teacher_temp,
             args.teacher_temp,
             args.warmup_teacher_temp_epochs,
@@ -284,35 +476,37 @@ def train_dino(args):
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups, fused=True)  # to use with ViTs
+        optimizer = torch.optim.AdamW(params_groups, fused=True)
     elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9, fused=True)  # lr is set by scheduler
+        optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9, fused=True)
     elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups, fused=True)  # to use with convnet and large batches
-    # for mixed precision training
+        optimizer = utils.LARS(params_groups, fused=True)
     fp16_scaler = None
     if args.use_fp16:
         fp16_scaler = torch.cuda.amp.GradScaler()
 
     # ============ init schedulers ... ============
+    # Schedules are per-iteration. With grad_accum, one "optimizer step" = grad_accum_steps iterations.
+    # The schedule length = epochs * iters_per_epoch (micro-batch iterations).
+    # We index by global_step (optimizer step count), so schedule length = epochs * steps_per_epoch.
+    steps_per_epoch = len(data_loader) // args.grad_accum_steps
     lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
+        args.lr * effective_batch / 256.,  # linear scaling rule
         args.min_lr,
-        args.epochs, len(data_loader),
+        args.epochs, steps_per_epoch,
         warmup_epochs=args.warmup_epochs,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
-        args.epochs, len(data_loader),
+        args.epochs, steps_per_epoch,
     )
-    # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                               args.epochs, len(data_loader))
-    print(f"Loss, optimizer and schedulers ready.")
+                                               args.epochs, steps_per_epoch)
+    print(f"Loss, optimizer and schedulers ready. Steps per epoch: {steps_per_epoch}")
 
     # ============ optionally resume training ... ============
-    to_restore = {"epoch": 0}
+    to_restore = {"epoch": 0, "best_knn": 0.0}
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
         run_variables=to_restore,
@@ -323,10 +517,24 @@ def train_dino(args):
         dino_loss=dino_loss,
     )
     start_epoch = to_restore["epoch"]
+    best_knn = to_restore.get("best_knn", 0.0)
+
+    # Restore RNG states if available
+    if os.path.isfile(ckp_path):
+        ckp = torch.load(ckp_path, map_location="cpu")
+        rng_states = ckp.get('rng_states', None)
+        if rng_states is not None:
+            random.setstate(rng_states['python'])
+            np.random.set_state(rng_states['numpy'])
+            torch.random.set_rng_state(rng_states['torch'])
+            torch.cuda.set_rng_state_all(rng_states['cuda'])
+            print("Restored RNG states from checkpoint.")
+        del ckp
 
     start_time = time.time()
-    print("Starting DINO training !")
+    print(f"Starting DINO training from epoch {start_epoch}!")
     for epoch in range(start_epoch, args.epochs):
+        epoch_start = time.time()
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
@@ -334,28 +542,64 @@ def train_dino(args):
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
-        # ============ writing logs ... ============
-        save_dict = {
-            'student': student.state_dict(),
-            'teacher': teacher.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch + 1,
-            'args': args,
-            'dino_loss': dino_loss.state_dict(),
-        }
-        if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+        epoch_time = time.time() - epoch_start
+
+        # ============ periodic k-NN evaluation ... ============
+        knn_top1 = 0.0
+        if (args.eval_freq > 0 and args.eval_data_path and
+                (epoch % args.eval_freq == 0 or epoch == args.epochs - 1)):
+            # Extract teacher backbone for eval
+            teacher_backbone = teacher_without_ddp.backbone
+            knn_top1 = _run_knn_eval(teacher_backbone, args)
+            if knn_top1 > best_knn:
+                best_knn = knn_top1
+                print(f"New best k-NN: {best_knn:.2f}%")
+
+        # ============ writing checkpoint ... ============
+        save_dict = _build_checkpoint(student, teacher, optimizer, fp16_scaler,
+                                       dino_loss, epoch, args, best_knn, wandb_run_id)
+
+        # Always save latest checkpoint
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+
+        # Periodic checkpoint with rotation
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_{epoch:04d}.pth'))
+            if utils.is_main_process():
+                _rotate_checkpoints(args.output_dir, keep_last=args.keep_last_ckpts)
+
+        # Save best checkpoint
+        if knn_top1 > 0 and knn_top1 >= best_knn:
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint_best.pth'))
+
+        # ============ writing logs ... ============
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch}
+                     'epoch': epoch,
+                     'epoch_time': epoch_time,
+                     'best_knn': best_knn}
+        if knn_top1 > 0:
+            log_stats['knn_top1'] = knn_top1
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        if args.enable_logging:
+            epoch_log = {"epoch": epoch, "epoch_time": epoch_time, "best_knn": best_knn}
+            if knn_top1 > 0:
+                epoch_log["knn_top1"] = knn_top1
+            wandb.log(epoch_log)
+
+        # ============ handle interruption ... ============
+        if _INTERRUPTED:
+            print(f"Interrupted at epoch {epoch}. Saving checkpoint_interrupted.pth ...")
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint_interrupted.pth'))
+            print("Checkpoint saved. Exiting.")
+            sys.exit(0)
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if args.enable_logging:
+        wandb.finish()
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
@@ -363,77 +607,104 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     epoch, fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
+
+    accum_steps = args.grad_accum_steps
+    steps_per_epoch = len(data_loader) // accum_steps
+
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
-        # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
+        # Determine if this is the last micro-step in an accumulation group
+        micro_step = it % accum_steps
+        is_accum_step = (micro_step == accum_steps - 1) or (it == len(data_loader) - 1)
+
+        # Global optimizer step index (for schedule lookup)
+        global_step = steps_per_epoch * epoch + (it // accum_steps)
+
+        # Update LR and WD on the first micro-step of each accumulation group
+        if micro_step == 0:
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group["lr"] = lr_schedule[global_step]
+                if i == 0:
+                    param_group["weight_decay"] = wd_schedule[global_step]
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
-        # teacher and student forward passes + compute dino loss
-        with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            if args.use_simdino:
-                loss, comp_loss, expa_loss = dino_loss(student_output, teacher_output)
+
+        # Use no_sync for non-final accumulation steps (skip all-reduce)
+        maybe_no_sync = student.no_sync if not is_accum_step else nullcontext
+        with maybe_no_sync():
+            with torch.cuda.amp.autocast(fp16_scaler is not None):
+                teacher_output = teacher(images[:2])
+                student_output = student(images)
+                if args.use_simdino:
+                    loss, comp_loss, expa_loss = dino_loss(student_output, teacher_output)
+                else:
+                    loss = dino_loss(student_output, teacher_output, epoch)
+                # Scale loss by accumulation steps
+                loss = loss / accum_steps
+
+            if not math.isfinite(loss.item() * accum_steps):
+                print("Loss is {}, stopping training".format(loss.item() * accum_steps), force=True)
+                sys.exit(1)
+
+            # Backward
+            if fp16_scaler is None:
+                loss.backward()
             else:
-                loss = dino_loss(student_output, teacher_output, epoch)
+                fp16_scaler.scale(loss).backward()
 
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
-            sys.exit(1)
-
-        # student update
-        optimizer.zero_grad()
-        param_norms = None
-        if fp16_scaler is None:
-            loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            optimizer.step()
-        else:
-            fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
-                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
-
-        # EMA update for the teacher
-        with torch.no_grad():
-            m = momentum_schedule[it]  # momentum parameter
-            # for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
-            #     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
-            if hasattr(torch, '_foreach_lerp_'):
-                torch._foreach_lerp_(list(teacher_without_ddp.parameters()), list(student.module.parameters()), weight=1. - m)
+        # Only step optimizer on accumulation boundary
+        if is_accum_step:
+            param_norms = None
+            if fp16_scaler is None:
+                if args.clip_grad:
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+                optimizer.step()
             else:
-                torch._foreach_mul_(list(teacher_without_ddp.parameters()), m)
-                torch._foreach_add_(list(teacher_without_ddp.parameters()), list(student.module.parameters()), alpha=1. - m)
+                fp16_scaler.unscale_(optimizer)
+                if args.clip_grad:
+                    param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+            optimizer.zero_grad()
 
-        # logging
-        torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
-        if args.use_simdino:
-            metric_logger.update(expa_loss=expa_loss.item())
-            metric_logger.update(comp_loss=comp_loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        if args.enable_logging:
-            logs2wb = {"loss": loss.item(), 
-                    "lr": optimizer.param_groups[0]["lr"], 
-                    "wd": optimizer.param_groups[0]["weight_decay"]}
+            # EMA update for the teacher (once per optimizer step)
+            with torch.no_grad():
+                m = momentum_schedule[global_step]
+                if hasattr(torch, '_foreach_lerp_'):
+                    torch._foreach_lerp_(list(teacher_without_ddp.parameters()),
+                                         list(student.module.parameters()), weight=1. - m)
+                else:
+                    torch._foreach_mul_(list(teacher_without_ddp.parameters()), m)
+                    torch._foreach_add_(list(teacher_without_ddp.parameters()),
+                                        list(student.module.parameters()), alpha=1. - m)
+
+            # logging (once per optimizer step)
+            torch.cuda.synchronize()
+            actual_loss = loss.item() * accum_steps  # unscaled loss
+            metric_logger.update(loss=actual_loss)
             if args.use_simdino:
-                logs2wb.update({"expa_loss": expa_loss.item(), 
-                                "comp_loss": comp_loss.item(),
-                                })
-            wandb.log(logs2wb) 
+                metric_logger.update(expa_loss=expa_loss.item())
+                metric_logger.update(comp_loss=comp_loss.item())
+            metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
+            if args.enable_logging:
+                logs2wb = {
+                    "loss": actual_loss,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "wd": optimizer.param_groups[0]["weight_decay"],
+                    "ema_momentum": m,
+                    "gpu_memory_mb": torch.cuda.max_memory_allocated() / (1024 * 1024),
+                }
+                if args.use_simdino:
+                    logs2wb["expa_loss"] = expa_loss.item()
+                    logs2wb["comp_loss"] = comp_loss.item()
+                if param_norms:
+                    logs2wb["grad_norm"] = max(param_norms)
+                wandb.log(logs2wb)
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

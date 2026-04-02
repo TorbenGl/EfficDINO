@@ -131,16 +131,104 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class EfficEmbedPatchEmbed(nn.Module):
+    """Structured sub-patch tokenization for ViT.
+
+    Instead of a single large conv (kernel=patch_size, stride=patch_size),
+    uses a smaller conv to extract fine-grained features, then folds
+    spatial positions within each patch region into the channel dimension
+    via a space-to-depth (inverse pixel-shuffle) operation.
+
+    Each token's embedding has explicit internal structure: groups of C
+    channels correspond to specific sub-patch spatial positions.
+
+    Example (patch_size=16, sub_patch_size=4, in_chans=3, embed_dim=768):
+      Conv2d(3, 48, kernel_size=4, stride=4) + GELU
+      (B, 3, 224, 224) -> (B, 48, 56, 56)
+      Space-to-depth: fold_factor = 16/4 = 4
+      (B, 48, 56, 56) -> (B, 48, 14, 4, 14, 4) -> (B, 768, 14, 14)
+      -> flatten -> (B, 196, 768)
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768,
+                 sub_patch_size=4, sub_patch_channels=None):
+        super().__init__()
+        assert patch_size % sub_patch_size == 0, \
+            f"patch_size ({patch_size}) must be divisible by sub_patch_size ({sub_patch_size})"
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.sub_patch_size = sub_patch_size
+        self.fold_factor = patch_size // sub_patch_size  # e.g. 16/4 = 4
+        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
+
+        # Compute sub-patch conv channels
+        fold_area = self.fold_factor ** 2  # e.g. 16
+        if sub_patch_channels is not None:
+            self.sub_channels = sub_patch_channels
+        else:
+            # Auto-compute: C such that C * fold_factor^2 == embed_dim
+            assert embed_dim % fold_area == 0, \
+                f"embed_dim ({embed_dim}) must be divisible by fold_factor^2 ({fold_area})"
+            self.sub_channels = embed_dim // fold_area  # e.g. 768/16 = 48
+
+        self.space_to_depth_dim = self.sub_channels * fold_area  # e.g. 48*16 = 768
+
+        # Small conv for sub-patch feature extraction
+        self.conv = nn.Conv2d(in_chans, self.sub_channels,
+                              kernel_size=sub_patch_size, stride=sub_patch_size)
+        self.act = nn.GELU()
+
+        # Optional 1x1 projection if space-to-depth dim != embed_dim
+        self.proj = None
+        if self.space_to_depth_dim != embed_dim:
+            self.proj = nn.Conv2d(self.space_to_depth_dim, embed_dim, kernel_size=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Step 1: Small conv feature extraction
+        # (B, 3, H, W) -> (B, sub_channels, H/k, W/k)
+        x = self.act(self.conv(x))
+
+        # Step 2: Space-to-depth within each patch_size region
+        # Current spatial: (H/k, W/k). We need to fold groups of fold_factor
+        # positions into channels to get (H/patch_size, W/patch_size) spatial.
+        _, c, h, w = x.shape
+        f = self.fold_factor
+        gh = h // f  # grid height = H / patch_size (e.g. 56/4=14 or 24/4=6)
+        gw = w // f  # grid width  = W / patch_size
+
+        # Reshape: (B, C, gh*f, gw*f) -> (B, C, gh, f, gw, f) -> (B, C*f*f, gh, gw)
+        x = x.reshape(B, c, gh, f, gw, f)
+        x = x.permute(0, 1, 3, 5, 2, 4)  # (B, C, f, f, gh, gw)
+        x = x.reshape(B, c * f * f, gh, gw)  # (B, C*f^2, gh, gw)
+
+        # Optional projection
+        if self.proj is not None:
+            x = self.proj(x)
+
+        # Flatten to sequence: (B, embed_dim, gh, gw) -> (B, gh*gw, embed_dim)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
 class VisionTransformer(nn.Module):
     """ Vision Transformer """
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, **kwargs):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 embed_type='standard', sub_patch_size=4, sub_patch_channels=None, **kwargs):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
 
-        self.patch_embed = PatchEmbed(
-            img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        if embed_type == 'efficembed':
+            self.patch_embed = EfficEmbedPatchEmbed(
+                img_size=img_size[0], patch_size=patch_size, in_chans=in_chans,
+                embed_dim=embed_dim, sub_patch_size=sub_patch_size,
+                sub_patch_channels=sub_patch_channels)
+        else:
+            self.patch_embed = PatchEmbed(
+                img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -234,24 +322,30 @@ class VisionTransformer(nn.Module):
         return output
 
 
-def vit_tiny(patch_size=16, **kwargs):
+def vit_tiny(patch_size=16, embed_type='standard', sub_patch_size=4, sub_patch_channels=None, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        embed_type=embed_type, sub_patch_size=sub_patch_size,
+        sub_patch_channels=sub_patch_channels, **kwargs)
     return model
 
 
-def vit_small(patch_size=16, **kwargs):
+def vit_small(patch_size=16, embed_type='standard', sub_patch_size=4, sub_patch_channels=None, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        embed_type=embed_type, sub_patch_size=sub_patch_size,
+        sub_patch_channels=sub_patch_channels, **kwargs)
     return model
 
 
-def vit_base(patch_size=16, **kwargs):
+def vit_base(patch_size=16, embed_type='standard', sub_patch_size=4, sub_patch_channels=None, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        embed_type=embed_type, sub_patch_size=sub_patch_size,
+        sub_patch_channels=sub_patch_channels, **kwargs)
     return model
 
 

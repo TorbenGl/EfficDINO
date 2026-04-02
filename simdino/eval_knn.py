@@ -20,6 +20,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from PIL import Image
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
@@ -37,8 +38,12 @@ def extract_feature_pipeline(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = ReturnIndexDataset(os.path.join(args.data_path, "train"), transform=transform)
-    dataset_val = ReturnIndexDataset(os.path.join(args.data_path, "val"), transform=transform)
+    if getattr(args, 'dataset_type', 'imagefolder') == 'hf_imagenet':
+        dataset_train = ReturnIndexHFDataset(_load_hf_dataset(args.data_path, 'train'), transform=transform)
+        dataset_val = ReturnIndexHFDataset(_load_hf_dataset(args.data_path, 'validation'), transform=transform)
+    else:
+        dataset_train = ReturnIndexDataset(os.path.join(args.data_path, "train"), transform=transform)
+        dataset_val = ReturnIndexDataset(os.path.join(args.data_path, "val"), transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=False)
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -59,8 +64,13 @@ def extract_feature_pipeline(args):
 
     # ============ building network ... ============
     if "vit" in args.arch:
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
-        print(f"Model {args.arch} {args.patch_size}x{args.patch_size} built.")
+        model = vits.__dict__[args.arch](
+            patch_size=args.patch_size, num_classes=0,
+            embed_type=getattr(args, 'embed_type', 'standard'),
+            sub_patch_size=getattr(args, 'sub_patch_size', 4),
+            sub_patch_channels=getattr(args, 'sub_patch_channels', None),
+        )
+        print(f"Model {args.arch} {args.patch_size}x{args.patch_size} (embed_type={getattr(args, 'embed_type', 'standard')}) built.")
     elif "xcit" in args.arch:
         model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
     elif args.arch in torchvision_models.__dict__.keys():
@@ -83,8 +93,8 @@ def extract_feature_pipeline(args):
         train_features = nn.functional.normalize(train_features, dim=1, p=2)
         test_features = nn.functional.normalize(test_features, dim=1, p=2)
 
-    train_labels = torch.tensor([s[-1] for s in dataset_train.samples]).long()
-    test_labels = torch.tensor([s[-1] for s in dataset_val.samples]).long()
+    train_labels = torch.tensor(dataset_train.targets).long()
+    test_labels = torch.tensor(dataset_val.targets).long()
     # save features and labels
     if args.dump_features and dist.get_rank() == 0:
         torch.save(train_features.cpu(), os.path.join(args.dump_features, "trainfeat.pth"))
@@ -190,6 +200,42 @@ class ReturnIndexDataset(datasets.ImageFolder):
         return img, idx
 
 
+class HFImageNetDataset(torch.utils.data.Dataset):
+    """Wraps a HuggingFace datasets.Dataset as a PyTorch Dataset."""
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
+        self.transform = transform
+
+    @property
+    def targets(self):
+        return [int(x) for x in self.dataset['label']]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        img = sample['image']
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        img = img.convert('RGB')
+        label = int(sample['label'])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+class ReturnIndexHFDataset(HFImageNetDataset):
+    def __getitem__(self, idx):
+        img, _ = super().__getitem__(idx)
+        return img, idx
+
+
+def _load_hf_dataset(data_path, split):
+    from datasets import load_dataset
+    return load_dataset(data_path, split=split, trust_remote_code=False)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Evaluation with weighted k-NN on ImageNet')
     parser.add_argument('--batch_size_per_gpu', default=128, type=int, help='Per-GPU batch-size')
@@ -213,6 +259,13 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--dataset_type', default='imagefolder', type=str,
+        choices=['imagefolder', 'hf_imagenet'],
+        help='Dataset format: imagefolder (default) or hf_imagenet (HuggingFace snapshot_download root)')
+    parser.add_argument('--embed_type', default='standard', type=str, choices=['standard', 'efficembed'],
+        help='Patch embedding type (must match training)')
+    parser.add_argument('--sub_patch_size', default=4, type=int, help='Sub-patch size for efficembed')
+    parser.add_argument('--sub_patch_channels', default=None, type=int, help='Sub-patch channels for efficembed')
     args = parser.parse_args()
 
     utils.init_distributed_mode(args)

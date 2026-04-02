@@ -1,0 +1,18 @@
+# Linux GPU server requirements (CUDA 11.8)
+# Install: pip install -r requirements-server.txt
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.5.1
+torchvision
+omegaconf
+torchmetrics
+fvcore
+iopath
+xformers==0.0.29
+submitit
+--extra-index-url https://pypi.nvidia.com
+cuml-cu11
+einops
+wandb
+timm
+datasets>=2.18.0
+huggingface_hub>=0.21.0

@@ -20,3 +20,7 @@ sbatch_logs/
 debug
 wandb
 swanlog
+
+checkpoints/
+logs/
+features/

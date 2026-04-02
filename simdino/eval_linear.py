@@ -20,12 +20,39 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from PIL import Image
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
+
+
+class HFImageNetDataset(torch.utils.data.Dataset):
+    """Wraps a HuggingFace datasets.Dataset as a PyTorch Dataset."""
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        img = sample['image']
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        img = img.convert('RGB')
+        label = int(sample['label'])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+def _load_hf_dataset(data_path, split):
+    from datasets import load_dataset
+    return load_dataset(data_path, split=split, trust_remote_code=False)
 
 
 def eval_linear(args):
@@ -37,7 +64,12 @@ def eval_linear(args):
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        model = vits.__dict__[args.arch](
+            patch_size=args.patch_size, num_classes=0,
+            embed_type=getattr(args, 'embed_type', 'standard'),
+            sub_patch_size=getattr(args, 'sub_patch_size', 4),
+            sub_patch_channels=getattr(args, 'sub_patch_channels', None),
+        )
         embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
     # if the network is a XCiT
     elif "xcit" in args.arch:
@@ -68,7 +100,10 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    if getattr(args, 'dataset_type', 'imagefolder') == 'hf_imagenet':
+        dataset_val = HFImageNetDataset(_load_hf_dataset(args.data_path, 'validation'), transform=val_transform)
+    else:
+        dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -88,7 +123,10 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    if getattr(args, 'dataset_type', 'imagefolder') == 'hf_imagenet':
+        dataset_train = HFImageNetDataset(_load_hf_dataset(args.data_path, 'train'), transform=train_transform)
+    else:
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -272,11 +310,18 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--dataset_type', default='imagefolder', type=str,
+        choices=['imagefolder', 'hf_imagenet'],
+        help='Dataset format: imagefolder (default) or hf_imagenet (HuggingFace snapshot_download root)')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
     parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+    parser.add_argument('--embed_type', default='standard', type=str, choices=['standard', 'efficembed'],
+        help='Patch embedding type (must match training)')
+    parser.add_argument('--sub_patch_size', default=4, type=int, help='Sub-patch size for efficembed')
+    parser.add_argument('--sub_patch_channels', default=None, type=int, help='Sub-patch channels for efficembed')
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     eval_linear(args)
