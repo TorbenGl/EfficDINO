@@ -408,3 +408,98 @@ class PatchEmbed(nn.Module):
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
+
+
+class EfficEmbedPatchEmbed(nn.Module):
+    """Structured sub-patch tokenization for ViT (simdinov2 version).
+
+    Instead of a single large conv (kernel=patch_size, stride=patch_size),
+    uses a smaller conv to extract fine-grained features, then folds
+    spatial positions within each patch region into the channel dimension
+    via a space-to-depth (inverse pixel-shuffle) operation.
+
+    Example (patch_size=16, sub_patch_size=4, in_chans=3, embed_dim=768):
+      Conv2d(3, 48, kernel_size=4, stride=4) + GELU
+      (B, 3, 224, 224) -> (B, 48, 56, 56)
+      Space-to-depth: fold_factor = 16/4 = 4
+      (B, 48, 56, 56) -> (B, 768, 14, 14) -> flatten -> (B, 196, 768)
+
+    Interface matches simdinov2's embed_layer call:
+        embed_layer(img_size, patch_size, in_chans, embed_dim)
+    Sub-patch params arrive pre-filled via functools.partial from build_model().
+    """
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        norm_layer=None,
+        flatten_embedding=True,
+        sub_patch_size=4,
+        sub_patch_channels=None,
+    ):
+        super().__init__()
+        assert patch_size % sub_patch_size == 0, (
+            f"patch_size ({patch_size}) must be divisible by sub_patch_size ({sub_patch_size})"
+        )
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.sub_patch_size = sub_patch_size
+        self.fold_factor = patch_size // sub_patch_size  # e.g. 16/4 = 4
+        self.num_patches = (img_size // patch_size) ** 2
+
+        fold_area = self.fold_factor ** 2
+        if sub_patch_channels is not None:
+            self.sub_channels = sub_patch_channels
+        else:
+            assert embed_dim % fold_area == 0, (
+                f"embed_dim ({embed_dim}) must be divisible by fold_factor^2 ({fold_area})"
+            )
+            self.sub_channels = embed_dim // fold_area  # e.g. 768/16 = 48
+
+        self.space_to_depth_dim = self.sub_channels * fold_area
+
+        self.conv = nn.Conv2d(in_chans, self.sub_channels, kernel_size=sub_patch_size, stride=sub_patch_size)
+        self.act = nn.GELU()
+
+        self.proj = None
+        if self.space_to_depth_dim != embed_dim:
+            self.proj = nn.Conv2d(self.space_to_depth_dim, embed_dim, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+
+        # Small conv feature extraction
+        x = self.act(self.conv(x))  # (B, sub_channels, H/k, W/k)
+
+        # Space-to-depth: fold groups of fold_factor positions into channels
+        _, c, h, w = x.shape
+        f = self.fold_factor
+        gh = h // f  # grid height = H / patch_size
+        gw = w // f
+
+        x = x.reshape(B, c, gh, f, gw, f)
+        x = x.permute(0, 1, 3, 5, 2, 4)   # (B, C, f, f, gh, gw)
+        x = x.reshape(B, c * f * f, gh, gw)  # (B, C*f^2, gh, gw)
+
+        if self.proj is not None:
+            x = self.proj(x)
+
+        # Flatten to sequence: (B, embed_dim, gh, gw) -> (B, gh*gw, embed_dim)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+    def update_img_size(self, img_size):
+        self.img_size = img_size
+        self.num_patches = (img_size // self.patch_size) ** 2
+
+    def update_patch_size(self, patch_size):
+        # Rebuilding the conv for a new patch_size is non-trivial; stub for interface compliance
+        self.patch_size = patch_size
+        self.fold_factor = patch_size // self.sub_patch_size
+        self.num_patches = (self.img_size // patch_size) ** 2

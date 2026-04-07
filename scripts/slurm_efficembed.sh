@@ -11,13 +11,13 @@
 #   3. Activate your venv or set VENV_PATH
 # =============================================================================
 #SBATCH --job-name=efficembed-vitb16
-#SBATCH --partition=gpu-node
+#SBATCH --partition=kisski
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=128G
-#SBATCH --time=72:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/efficembed-%j.out
 #SBATCH --error=logs/efficembed-%j.err
 #SBATCH --signal=B:TERM@120

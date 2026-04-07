@@ -1,0 +1,30 @@
+# EfficEmbedDINOv2 ViT-B/16 — overrides for simdino_config.yaml base
+# Identical to vitb16_simdino.yaml but with EfficEmbedPatchEmbed tokenization.
+# sub_patch_channels is auto-computed: 768 / (16/4)^2 = 48
+train:
+  dataset_path: HFImageNet:split=TRAIN:root=/placeholder  # overridden at runtime
+  batch_size_per_gpu: 128  # 128 × 4 GPUs = 512 effective batch (matches paper's 64 × 8)
+  output_dir: ./checkpoints/efficembed_vitb16
+
+student:
+  arch: vit_base
+  block_chunks: 4
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  num_register_tokens: 0
+  interpolate_antialias: true
+  interpolate_offset: 0.0
+  qknorm: false
+  gradient_checkpointing: false
+  attn_drop: 0.0
+  ffn_drop: 0.0
+  embed_type: efficembed
+  sub_patch_size: 4
+
+optim:
+  epochs: 100
+  base_lr: 0.001
+  clip_grad: 0.3
+  warmup_epochs: 10

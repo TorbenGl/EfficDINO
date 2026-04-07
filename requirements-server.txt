@@ -1,18 +1,27 @@
-# Linux GPU server requirements (CUDA 11.8)
-# Install: pip install -r requirements-server.txt
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.5.1
-torchvision
+# Linux GPU server requirements (CUDA 12.6)
+# Install: uv pip install -r requirements-server.txt --index-strategy unsafe-best-match
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+xformers
+
+# simdinov2 core deps
 omegaconf
-torchmetrics
 fvcore
 iopath
-xformers==0.0.29
-submitit
---extra-index-url https://pypi.nvidia.com
-cuml-cu11
 einops
+timm>=0.9.0
+submitit
+
+# logging / data
 wandb
-timm
-datasets>=2.18.0
-huggingface_hub>=0.21.0
+datasets==4.5.0
+huggingface_hub==1.7.1
+
+# pinned working versions (Python 3.9.25 / cu126 verified)
+numpy==2.0.2
+pillow==11.3.0
+pyarrow==21.0.0
+requests==2.32.5

@@ -1,0 +1,30 @@
+# SimDINOv2 ViT-B/16 baseline — overrides for simdino_config.yaml base
+# Usage (via run_or_resume_dinov2.sh):
+#   --base-config simdino_config
+#   --config-file simdinov2/configs/train/vitb16_simdino.yaml
+#   train.dataset_path=HFImageNet:split=TRAIN:root=${HF_DATA_PATH}
+train:
+  dataset_path: HFImageNet:split=TRAIN:root=/placeholder  # overridden at runtime
+  batch_size_per_gpu: 128  # 128 × 4 GPUs = 512 effective batch (matches paper's 64 × 8)
+  output_dir: ./checkpoints/simdinov2_vitb16_baseline
+
+student:
+  arch: vit_base
+  block_chunks: 4
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  num_register_tokens: 0
+  interpolate_antialias: true
+  interpolate_offset: 0.0
+  qknorm: false
+  gradient_checkpointing: false
+  attn_drop: 0.0
+  ffn_drop: 0.0
+
+optim:
+  epochs: 100
+  base_lr: 0.001
+  clip_grad: 0.3
+  warmup_epochs: 10

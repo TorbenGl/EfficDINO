@@ -4,8 +4,10 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 import logging
+from functools import partial
 
 from . import vision_transformer as vits
+from simdinov2.layers import EfficEmbedPatchEmbed
 
 
 logger = logging.getLogger("dinov2")
@@ -20,6 +22,14 @@ def build_model(args, only_teacher=False, img_size=224, patch_size=16):
                   "drop_path_rate", "attn_drop", "ffn_drop",
                   'pretrained_weights', 'pretrained_patch_size', 'pretrained_img_size', 'freeze_backbone_epochs']:
             vit_kwargs.pop(i, None)
+        if getattr(args, "embed_type", None) == "efficembed":
+            vit_kwargs["embed_layer"] = partial(
+                EfficEmbedPatchEmbed,
+                sub_patch_size=getattr(args, "sub_patch_size", 4),
+                sub_patch_channels=getattr(args, "sub_patch_channels", None),
+            )
+        for key in ("embed_type", "sub_patch_size", "sub_patch_channels"):
+            vit_kwargs.pop(key, None)
         teacher = vits.__dict__[args.arch](**vit_kwargs)
         if only_teacher:
             return teacher, teacher.embed_dim

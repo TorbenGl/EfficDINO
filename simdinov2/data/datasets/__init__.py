@@ -5,3 +5,4 @@
 
 from .image_net import ImageNet
 from .image_net21k import ImageNet21k
+from .hf_image_net import HFImageNetDataset

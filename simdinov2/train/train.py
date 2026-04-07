@@ -65,6 +65,8 @@ For python-based LazyConfig, use "path.key=value".
         type=str,
         help="Output directory to save logs and checkpoints",
     )
+    parser.add_argument("--wandb-project", default="", type=str, help="WandB project name (empty = disabled)")
+    parser.add_argument("--wandb-run-name", default="", type=str, help="WandB run name")
 
     return parser
 
@@ -373,9 +375,10 @@ def do_train(cfg, model, resume=False):
             total_grad_norm=total_grad_norm
             )
         metric_logger.update(**loss_dict_reduced)
-        if not cfg.debug and dist.is_main_process():
-            # swanlab.log(loss_dict_reduced)
-            pass
+        if dist.is_main_process():
+            import wandb
+            if wandb.run is not None:
+                wandb.log(loss_dict_reduced, step=iteration)
 
         # checkpointing and testing
         if "schedulefree" in cfg.optim.opt.lower():
@@ -399,14 +402,14 @@ def main(args):
             logger.info("========Debug Mode Enabled==========")
             torch.cuda.memory._record_memory_history()
             torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-        else:
-            pass
-            # swanlab.init(
-            #     project="dinov2",
-            #     logdir='./logs',
-            #     mode="local",
-            #     experiment_name=os.path.basename(cfg.train.output_dir),
-            #     config=cfg)
+        if args.wandb_project:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name or None,
+                config=dict(cfg),
+                resume="allow",
+            )
     logger.info(f"Train with recipe:{cfg.train.recipe}")
     model = SimSSLMetaArch(cfg).to(torch.device("cuda"))
     logger.info(f"Init last layer weight:{model.student.backbone.blocks[-1][-1].mlp.fc2.state_dict()}")
@@ -427,6 +430,10 @@ def main(args):
         torch.cuda.memory._dump_snapshot("before_train.pickle")
         os.system("python _memory_viz.py before_train before_train.pickle")
     do_train(cfg, model, resume=not args.no_resume)
+    if dist.is_main_process():
+        import wandb
+        if wandb.run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":
