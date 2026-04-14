@@ -327,7 +327,7 @@ def train_dino(args):
             f.write(" ".join(sys.argv) + "\n")
             f.write(str(vars(args)))
         import shutil
-        shutil.copyfile("main_dino.py", f"{args.output_dir}/main.py")
+        shutil.copyfile(Path(__file__), f"{args.output_dir}/main.py")
     print_ = builtins.print
     log_file = Path(args.output_dir, "output.log")
     def print(*args, **kwargs):
