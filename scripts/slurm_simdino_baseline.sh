@@ -12,10 +12,11 @@
 # =============================================================================
 #SBATCH --job-name=simdino-vitb16-baseline
 #SBATCH --partition=kisski
+#SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=10
+#SBATCH --gres=gpu:A100:4
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/simdino-baseline-%j.out

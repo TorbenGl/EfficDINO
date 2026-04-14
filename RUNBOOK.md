@@ -69,10 +69,10 @@ source ~/.bashrc
 
 ## Step 5 — Smoke test (interactive session)
 
-Allocate 4 GPUs interactively:
+Allocate 4 GPUs interactively (`--qos=2h` gets you to the front of the queue):
 ```bash
-srun --partition=kisski --nodes=1 --ntasks-per-node=4 --gpus-per-task=1 \
-     --cpus-per-task=10 --mem=64G --time=01:00:00 --pty bash
+srun --partition=kisski --qos=2h --nodes=1 --ntasks-per-node=4 \
+     --gres=gpu:A100:4 --cpus-per-task=16 --mem=64G --time=02:00:00 --pty bash
 ```
 
 Inside the session:

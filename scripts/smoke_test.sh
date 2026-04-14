@@ -6,8 +6,8 @@
 # config issues, and data loading problems before a full job submission.
 #
 # Get an interactive session first:
-#   srun --partition=kisski --nodes=1 --ntasks-per-node=4 --gpus-per-task=1 \
-#        --cpus-per-task=10 --mem=64G --time=01:00:00 --pty bash
+#   srun --partition=kisski --nodes=1 --ntasks-per-node=4 \
+#        --gres=gpu:A100:4 --cpus-per-task=10 --mem=64G --time=01:00:00 --pty bash
 #
 # Then run:
 #   cd ~/EfficDINO && source .venv/bin/activate
@@ -47,8 +47,9 @@ run_mode() {
         PASS=$((PASS + 1))
     else
         echo "  ✗ FAIL: ${name}"
-        echo "  --- last 30 lines ---"
-        tail -30 "$logfile"
+        echo "  --- first Python error ---"
+        grep -m1 -A 25 "Traceback\|^Error\|ImportError\|ModuleNotFoundError\|ValueError\|RuntimeError" "$logfile" || tail -40 "$logfile"
+        echo "  (full log: ${logfile})"
         FAIL=$((FAIL + 1))
     fi
 }
