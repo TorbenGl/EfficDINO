@@ -19,10 +19,12 @@ class HFImageNetDataset(torch.utils.data.Dataset):
     }
 
     def __init__(self, root, split, transform=None, target_transform=None):
+        import os
         from datasets import load_dataset
 
         hf_split = self._SPLIT_MAP.get(split, split)
-        self.dataset = load_dataset(root, split=hf_split, trust_remote_code=False)
+        cache_dir = os.path.join(root, ".hf_cache")
+        self.dataset = load_dataset(root, split=hf_split, trust_remote_code=False, cache_dir=cache_dir)
         self.transform = transform
         self.target_transform = target_transform
 

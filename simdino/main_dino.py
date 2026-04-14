@@ -72,8 +72,10 @@ class HFImageNetDataset(torch.utils.data.Dataset):
 
 
 def _load_hf_dataset(data_path, split):
+    import os
     from datasets import load_dataset
-    return load_dataset(data_path, split=split, trust_remote_code=False)
+    cache_dir = os.path.join(data_path, ".hf_cache")
+    return load_dataset(data_path, split=split, trust_remote_code=False, cache_dir=cache_dir)
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
