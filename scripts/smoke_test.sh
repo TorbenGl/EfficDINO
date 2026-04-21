@@ -70,6 +70,7 @@ run_mode "simdino_baseline" \
     --global_crops_scale 0.4 1.0 --local_crops_scale 0.05 0.4 \
     --use_simdino True --eps 0.5 --coeff 1.0 --reduce_cov 1 --expa_type 1 \
     --use_fp16 True \
+    --compile False \
     --z_dim 256 --hidden_dim 2048 \
     --dataset_type hf_imagenet \
     --data_path "${HF_DATA_PATH}" \
@@ -92,6 +93,7 @@ run_mode "simdino_efficembed" \
     --global_crops_scale 0.4 1.0 --local_crops_scale 0.05 0.4 \
     --use_simdino True --eps 0.5 --coeff 1.0 --reduce_cov 1 --expa_type 1 \
     --use_fp16 True \
+    --compile False \
     --z_dim 256 --hidden_dim 2048 \
     --dataset_type hf_imagenet \
     --data_path "${HF_DATA_PATH}" \

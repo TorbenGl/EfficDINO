@@ -449,8 +449,9 @@ def train_dino(args):
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     if args.compile:
-        teacher = torch.compile(teacher)
-        student = torch.compile(student)
+        compile_backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+        teacher = torch.compile(teacher, backend=compile_backend)
+        student = torch.compile(student, backend=compile_backend)
     for p in teacher.parameters():
         p.requires_grad = False
 

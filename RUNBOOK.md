@@ -65,6 +65,12 @@ echo 'export HF_DATA_PATH="/path/to/data/imagenet-1k"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
+> **Important:** use the full absolute path — do not use `~` or `$HOME`. The `datasets` library
+> does not expand tildes and will throw `HFValidationError` if the path contains `~`.
+> 
+> Bad:  `export HF_DATA_PATH="~/imagenet-1k"`
+> Good: `export HF_DATA_PATH="/trinity/home/tglobisch/imagenet-1k"`
+
 ---
 
 ## Step 5 — Smoke test (interactive session)
